@@ -181,7 +181,7 @@ func NewH3ProxyTransport(conn net.PacketConn, proxyAddr string, opts ...Transpor
 	}
 
 	tr := &http3.Transport{
-		Dial: func(ctx context.Context, _ string, tlsCfg *stdTLS.Config, quicCfg *quic.Config) (quic.EarlyConnection, error) {
+		Dial: func(ctx context.Context, _ string, tlsCfg *stdTLS.Config, quicCfg *quic.Config) (*quic.Conn, error) {
 			parsedProxyAddr, err := transport.MakeNetAddr("udp", proxyAddr)
 			if err != nil {
 				return nil, fmt.Errorf("failed to parse proxy address %s: %w", proxyAddr, err)
