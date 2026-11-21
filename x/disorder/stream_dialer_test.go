@@ -69,3 +69,36 @@ func TestDisorderOverWrappedConn(t *testing.T) {
 		l.Close()
 	}
 }
+
+// pipeConn is a StreamConn with no TCP socket under it. It records Close.
+type pipeConn struct {
+	net.Conn
+	closed int
+}
+
+func (c *pipeConn) CloseRead() error  { return nil }
+func (c *pipeConn) CloseWrite() error { return nil }
+func (c *pipeConn) Close() error {
+	c.closed++
+	return c.Conn.Close()
+}
+
+type pipeDialer struct{ conn *pipeConn }
+
+func (d pipeDialer) DialStream(context.Context, string) (transport.StreamConn, error) {
+	return d.conn, nil
+}
+
+// TestDisorderClosesConnWithoutSocket checks that a base connection disorder
+// can't use is closed, not leaked, since the caller never gets it.
+func TestDisorderClosesConnWithoutSocket(t *testing.T) {
+	a, b := net.Pipe()
+	defer b.Close()
+	conn := &pipeConn{Conn: a}
+	dialer, err := NewStreamDialer(pipeDialer{conn: conn}, 1)
+	require.NoError(t, err)
+	got, err := dialer.DialStream(context.Background(), "example.com:443")
+	require.Error(t, err)
+	require.Nil(t, got)
+	require.Equal(t, 1, conn.closed)
+}
