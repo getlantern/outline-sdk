@@ -87,6 +87,17 @@ func TestTCPConnOf(t *testing.T) {
 		require.Same(t, tcp, got, name)
 	}
 
+	// The socket is found under exactly maxWrapperDepth wrappers, not one more.
+	var atLimit net.Conn = tcp
+	for range maxWrapperDepth {
+		atLimit = wrappedConn{atLimit}
+	}
+	got, ok := TCPConnOf(atLimit)
+	require.True(t, ok, "at the wrapper limit")
+	require.Same(t, tcp, got)
+	_, ok = TCPConnOf(wrappedConn{atLimit})
+	require.False(t, ok, "past the wrapper limit")
+
 	udp, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
 	require.NoError(t, err)
 	defer udp.Close()

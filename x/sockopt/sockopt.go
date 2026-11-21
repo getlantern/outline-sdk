@@ -97,10 +97,11 @@ func TCPConnOf(conn net.Conn) (*net.TCPConn, bool) {
 		}
 		conn = wrapper.NetConn()
 	}
-	return nil, false
+	tcp, ok := conn.(*net.TCPConn)
+	return tcp, ok
 }
 
-// maxWrapperDepth bounds how many wrappers TCPConnOf looks through.
+// maxWrapperDepth is how many wrappers TCPConnOf looks through.
 const maxWrapperDepth = 16
 
 // NewTCPOptions creates a [TCPOptions] for the given [net.TCPConn].
