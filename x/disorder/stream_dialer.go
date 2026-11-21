@@ -18,7 +18,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"net"
 
 	"golang.getoutline.org/sdk/transport"
 	"golang.getoutline.org/sdk/x/sockopt"
@@ -56,9 +55,10 @@ func (d *disorderDialer) DialStream(ctx context.Context, remoteAddr string) (tra
 		return nil, err
 	}
 
-	tcpInnerConn, ok := innerConn.(*net.TCPConn)
+	tcpInnerConn, ok := sockopt.TCPConnOf(innerConn)
 	if !ok {
-		return nil, fmt.Errorf("disorder strategy: expected base dialer to return TCPConn")
+		innerConn.Close()
+		return nil, fmt.Errorf("disorder strategy: expected base dialer to return a TCPConn, got %T", innerConn)
 	}
 	tcpOptions, err := sockopt.NewTCPOptions(tcpInnerConn)
 	if err != nil {

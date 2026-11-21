@@ -81,6 +81,29 @@ func newHopLimit(conn net.Conn) (*hopLimitOption, error) {
 	return opt, nil
 }
 
+// TCPConnOf returns the [net.TCPConn] that conn is or wraps. It follows
+// NetConn methods, as [crypto/tls.Conn] has, so a wrapper that keeps the
+// socket, such as a dialer's connection tracker, still yields it.
+func TCPConnOf(conn net.Conn) (*net.TCPConn, bool) {
+	// The bound stops a wrapper that returns itself. Comparing conns
+	// instead could panic on a wrapper type that isn't comparable.
+	for range maxWrapperDepth {
+		if tcp, ok := conn.(*net.TCPConn); ok {
+			return tcp, true
+		}
+		wrapper, ok := conn.(interface{ NetConn() net.Conn })
+		if !ok {
+			return nil, false
+		}
+		conn = wrapper.NetConn()
+	}
+	tcp, ok := conn.(*net.TCPConn)
+	return tcp, ok
+}
+
+// maxWrapperDepth is how many wrappers TCPConnOf looks through.
+const maxWrapperDepth = 16
+
 // NewTCPOptions creates a [TCPOptions] for the given [net.TCPConn].
 func NewTCPOptions(conn *net.TCPConn) (TCPOptions, error) {
 	hopLimit, err := newHopLimit(conn)

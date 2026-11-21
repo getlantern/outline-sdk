@@ -52,3 +52,62 @@ func TestTCPOptions(t *testing.T) {
 		require.Equal(t, 20, hoplim)
 	}
 }
+
+// wrappedConn hides the socket's type, as a dialer's connection tracker does,
+// and gives it back through NetConn.
+type wrappedConn struct{ net.Conn }
+
+func (c wrappedConn) NetConn() net.Conn { return c.Conn }
+
+// selfConn reports itself as what it wraps, which must not loop. Its slice
+// field makes it uncomparable, which must not panic.
+type selfConn struct {
+	net.Conn
+	_ []string
+}
+
+func (c selfConn) NetConn() net.Conn { return c }
+
+func TestTCPConnOf(t *testing.T) {
+	l, err := net.Listen("tcp4", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer l.Close()
+	conn, err := net.Dial("tcp", l.Addr().String())
+	require.NoError(t, err)
+	defer conn.Close()
+	tcp := conn.(*net.TCPConn)
+
+	for name, c := range map[string]net.Conn{
+		"bare":          tcp,
+		"wrapped":       wrappedConn{tcp},
+		"wrapped twice": wrappedConn{wrappedConn{tcp}},
+	} {
+		got, ok := TCPConnOf(c)
+		require.True(t, ok, name)
+		require.Same(t, tcp, got, name)
+	}
+
+	// The socket is found under exactly maxWrapperDepth wrappers, not one more.
+	var atLimit net.Conn = tcp
+	for range maxWrapperDepth {
+		atLimit = wrappedConn{atLimit}
+	}
+	got, ok := TCPConnOf(atLimit)
+	require.True(t, ok, "at the wrapper limit")
+	require.Same(t, tcp, got)
+	_, ok = TCPConnOf(wrappedConn{atLimit})
+	require.False(t, ok, "past the wrapper limit")
+
+	udp, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	require.NoError(t, err)
+	defer udp.Close()
+	for name, c := range map[string]net.Conn{
+		"not TCP":         udp,
+		"wrapped not TCP": wrappedConn{udp},
+		"self":            selfConn{Conn: udp},
+		"nil":             nil,
+	} {
+		_, ok := TCPConnOf(c)
+		require.False(t, ok, name)
+	}
+}
