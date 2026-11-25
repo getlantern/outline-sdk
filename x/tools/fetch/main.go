@@ -170,7 +170,7 @@ func main() {
 		defer f.Close()
 		tlsConfig.KeyLogWriter = f
 	}
-	var quicConn quic.EarlyConnection
+	var quicConn *quic.Conn
 	registry := configurl.NewDefaultRegistry()
 	if *protoFlag == "h1" || *protoFlag == "h2" {
 		dialer, err := configurl.New[transport.StreamDialer](context.Background(), registry, *transportFlag)
@@ -229,7 +229,7 @@ func main() {
 		defer quicTransport.Close()
 		httpTransport := &http3.Transport{
 			TLSClientConfig: &tlsConfig,
-			Dial: func(ctx context.Context, addr string, tlsConf *tls.Config, quicConf *quic.Config) (quic.EarlyConnection, error) {
+			Dial: func(ctx context.Context, addr string, tlsConf *tls.Config, quicConf *quic.Config) (*quic.Conn, error) {
 				addressToDial, err := overrideAddress(addr, overrideHost, overridePort)
 				if err != nil {
 					return nil, fmt.Errorf("invalid address: %w", err)
