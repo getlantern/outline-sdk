@@ -29,6 +29,7 @@ import (
 	"reflect"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/goccy/go-yaml"
@@ -271,7 +272,11 @@ func (f *finder) testDialerSingleDomain(ctx context.Context, dialer transport.St
 	// connection may be closed from here, from tls's handshake interrupt and
 	// by tlsConn.Close, so closeOnceConn makes those one call.
 	testConn = &closeOnceConn{StreamConn: testConn}
-	stop := context.AfterFunc(testCtx, func() { testConn.Close() })
+	var closedByCtx atomic.Bool
+	stop := context.AfterFunc(testCtx, func() {
+		closedByCtx.Store(true)
+		testConn.Close()
+	})
 	defer stop()
 
 	// TLS Connection
@@ -292,14 +297,14 @@ func (f *finder) testDialerSingleDomain(ctx context.Context, dialer transport.St
 	}
 
 	if err := req.Write(tlsConn); err != nil {
-		err = withCause(testCtx, err)
+		err = withCause(testCtx, &closedByCtx, err)
 		logCtx(ctx, "🏁 failed to write HTTP request: '%v' (domain: %v), duration=%v, error=%v ❌\n", transportCfg, testDomain, time.Since(startTime), err)
 		return err
 	}
 
 	resp, err := http.ReadResponse(bufio.NewReader(tlsConn), req)
 	if err != nil {
-		err = withCause(testCtx, err)
+		err = withCause(testCtx, &closedByCtx, err)
 		logCtx(ctx, "🏁 failed to read HTTP response: '%v' (domain: %v), duration=%v, error=%v ❌\n", transportCfg, testDomain, time.Since(startTime), err)
 		return err
 	}
@@ -324,11 +329,12 @@ func (c *closeOnceConn) Close() error {
 	return c.err
 }
 
-// withCause adds why ctx ended to err, an I/O error from a connection closed
-// because it did, so a probe that timed out says so.
-func withCause(ctx context.Context, err error) error {
-	if cause := context.Cause(ctx); cause != nil {
-		return fmt.Errorf("%w: %w", cause, err)
+// withCause adds why ctx ended to err, an I/O error, when closed reports
+// that ctx's ending closed the connection, so a probe that timed out says so
+// and one the server reset doesn't.
+func withCause(ctx context.Context, closed *atomic.Bool, err error) error {
+	if closed.Load() {
+		return fmt.Errorf("%w: %w", context.Cause(ctx), err)
 	}
 	return err
 }
