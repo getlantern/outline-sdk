@@ -35,8 +35,10 @@ func queryCancelled(t *testing.T, r Resolver) {
 	t.Helper()
 	q, err := NewQuestion("example.com.", dnsmessage.TypeA)
 	require.NoError(t, err)
+	const wait = 50 * time.Millisecond
 	ctx, cancel := context.WithCancel(context.Background())
-	time.AfterFunc(50*time.Millisecond, cancel)
+	time.AfterFunc(wait, cancel)
+	start := time.Now()
 	errc := make(chan error, 1)
 	go func() {
 		_, err := r.Query(ctx, *q)
@@ -44,7 +46,9 @@ func queryCancelled(t *testing.T, r Resolver) {
 	}()
 	select {
 	case err := <-errc:
-		require.Error(t, err)
+		// Still waiting when cancelled, and failed because it was.
+		require.GreaterOrEqual(t, time.Since(start), wait)
+		require.ErrorIs(t, err, context.Canceled)
 	case <-time.After(5 * time.Second):
 		t.Fatal("the query was still waiting for an answer long after its context was cancelled")
 	}
@@ -86,15 +90,15 @@ func TestHTTPSResolverClosesIdleConnections(t *testing.T) {
 	defer func() { httpsIdleConnTimeout = saved }()
 
 	closed := make(chan struct{})
+	// The handler runs off the test goroutine, so it reports errors with
+	// t.Errorf and http.Error rather than require.
 	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		body, err := io.ReadAll(r.Body)
-		require.NoError(t, err)
-		var req dnsmessage.Message
-		require.NoError(t, req.Unpack(body))
-		resp, err := newMessageResponse(req, &dnsmessage.AResource{A: [4]byte{192, 0, 2, 1}}, 60)
-		require.NoError(t, err)
-		wire, err := resp.Pack()
-		require.NoError(t, err)
+		wire, err := answerDNS(r.Body)
+		if err != nil {
+			t.Errorf("DoH handler: %v", err)
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
 		w.Header().Set("Content-Type", "application/dns-message")
 		w.Write(wire)
 	}))
@@ -116,5 +120,51 @@ func TestHTTPSResolverClosesIdleConnections(t *testing.T) {
 	case <-closed:
 	case <-time.After(5 * time.Second):
 		t.Fatal("the resolver kept its idle connection open")
+	}
+}
+
+// answerDNS answers the DNS query in body with one A record.
+func answerDNS(body io.Reader) ([]byte, error) {
+	data, err := io.ReadAll(body)
+	if err != nil {
+		return nil, err
+	}
+	var req dnsmessage.Message
+	if err := req.Unpack(data); err != nil {
+		return nil, err
+	}
+	resp, err := newMessageResponse(req, &dnsmessage.AResource{A: [4]byte{192, 0, 2, 1}}, 60)
+	if err != nil {
+		return nil, err
+	}
+	return resp.Pack()
+}
+
+// A DNS-over-TLS resolver whose handshake fails closes the TCP connection
+// it dialed, rather than leaving it to the server.
+func TestTLSResolverClosesConnectionOnHandshakeFailure(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer ln.Close()
+	closed := make(chan struct{})
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		// Not TLS, so the client's handshake fails at once.
+		conn.Write([]byte("HTTP/1.1 400 Bad Request\r\n\r\n"))
+		io.Copy(io.Discard, conn)
+		close(closed)
+	}()
+	q, err := NewQuestion("example.com.", dnsmessage.TypeA)
+	require.NoError(t, err)
+	_, err = NewTLSResolver(&transport.TCPDialer{}, ln.Addr().String(), "dns.example").Query(context.Background(), *q)
+	require.Error(t, err)
+	select {
+	case <-closed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the resolver left the connection of a failed handshake open")
 	}
 }

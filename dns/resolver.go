@@ -24,6 +24,7 @@ import (
 	"math/rand"
 	"net"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
@@ -272,7 +273,8 @@ func NewUDPResolver(pd transport.PacketDialer, resolverAddr string) Resolver {
 			conn.SetDeadline(deadline)
 		}
 		defer unblockOnDone(ctx, conn)()
-		return queryDatagram(conn, q)
+		msg, err := queryDatagram(conn, q)
+		return msg, withCancelCause(ctx, err)
 	})
 }
 
@@ -291,7 +293,8 @@ func (r *streamResolver) Query(ctx context.Context, q dnsmessage.Question) (*dns
 		conn.SetDeadline(deadline)
 	}
 	defer unblockOnDone(ctx, conn)()
-	return queryStream(conn, q)
+	msg, err := queryStream(conn, q)
+	return msg, withCancelCause(ctx, err)
 }
 
 // unblockOnDone moves conn's deadline to now once ctx ends, so a query's
@@ -300,6 +303,16 @@ func (r *streamResolver) Query(ctx context.Context, q dnsmessage.Question) (*dns
 // must be called once the query returns.
 func unblockOnDone(ctx context.Context, conn interface{ SetDeadline(time.Time) error }) func() bool {
 	return context.AfterFunc(ctx, func() { conn.SetDeadline(time.Now()) })
+}
+
+// withCancelCause adds why ctx ended to err when err is the deadline
+// unblockOnDone forced, so a query cancelled without a deadline reports its
+// cancellation rather than an I/O timeout.
+func withCancelCause(ctx context.Context, err error) error {
+	if err != nil && ctx.Err() != nil && errors.Is(err, os.ErrDeadlineExceeded) {
+		return fmt.Errorf("%w: %w", context.Cause(ctx), err)
+	}
+	return err
 }
 
 // NewTCPResolver creates a [Resolver] that implements the [DNS-over-TCP] protocol, using a [transport.StreamDialer] for transport.
@@ -329,7 +342,13 @@ func NewTLSResolver(sd transport.StreamDialer, resolverAddr string, resolverName
 			if err != nil {
 				return nil, err
 			}
-			return tls.WrapConn(ctx, baseConn, resolverName)
+			conn, err := tls.WrapConn(ctx, baseConn, resolverName)
+			if err != nil {
+				// The handshake closes baseConn only when ctx ends.
+				baseConn.Close()
+				return nil, err
+			}
+			return conn, nil
 		},
 	}
 }
