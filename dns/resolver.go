@@ -24,7 +24,6 @@ import (
 	"math/rand"
 	"net"
 	"net/http"
-	"os"
 	"strings"
 	"time"
 
@@ -273,8 +272,7 @@ func NewUDPResolver(pd transport.PacketDialer, resolverAddr string) Resolver {
 			conn.SetDeadline(deadline)
 		}
 		defer unblockOnDone(ctx, conn)()
-		msg, err := queryDatagram(conn, q)
-		return msg, withCancelCause(ctx, err)
+		return queryDatagram(conn, q)
 	})
 }
 
@@ -293,8 +291,7 @@ func (r *streamResolver) Query(ctx context.Context, q dnsmessage.Question) (*dns
 		conn.SetDeadline(deadline)
 	}
 	defer unblockOnDone(ctx, conn)()
-	msg, err := queryStream(conn, q)
-	return msg, withCancelCause(ctx, err)
+	return queryStream(conn, q)
 }
 
 // unblockOnDone moves conn's deadline to now once ctx ends, so a query's
@@ -303,29 +300,6 @@ func (r *streamResolver) Query(ctx context.Context, q dnsmessage.Question) (*dns
 // must be called once the query returns.
 func unblockOnDone(ctx context.Context, conn interface{ SetDeadline(time.Time) error }) func() bool {
 	return context.AfterFunc(ctx, func() { conn.SetDeadline(time.Now()) })
-}
-
-// withCancelCause adds ctx's error, and its cause when that differs, to err
-// when err is a timeout and ctx has ended or reached its deadline, so a query
-// ended by its context says so rather than reporting only an I/O timeout. The
-// conn's deadline and ctx's timer fire together, so a deadline already passed
-// counts as ended even before ctx.Err reports it.
-func withCancelCause(ctx context.Context, err error) error {
-	var netErr net.Error
-	if err == nil || !(errors.Is(err, os.ErrDeadlineExceeded) || errors.As(err, &netErr) && netErr.Timeout()) {
-		return err
-	}
-	ctxErr := ctx.Err()
-	if deadline, ok := ctx.Deadline(); ctxErr == nil && ok && !time.Now().Before(deadline) {
-		ctxErr = context.DeadlineExceeded
-	}
-	if ctxErr == nil {
-		return err
-	}
-	if cause := context.Cause(ctx); cause != nil && cause != ctxErr {
-		return fmt.Errorf("%w: %w: %w", err, ctxErr, cause)
-	}
-	return fmt.Errorf("%w: %w", err, ctxErr)
 }
 
 // NewTCPResolver creates a [Resolver] that implements the [DNS-over-TCP] protocol, using a [transport.StreamDialer] for transport.

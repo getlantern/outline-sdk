@@ -16,7 +16,6 @@ package dns
 
 import (
 	"context"
-	"errors"
 	"io"
 	"net"
 	"net/http"
@@ -31,8 +30,6 @@ import (
 	"golang.org/x/net/dns/dnsmessage"
 )
 
-var errShutdown = errors.New("shutting down")
-
 // queryCancelled queries r with a context that is cancelled, with no deadline,
 // after a short wait, and fails unless the query returns soon after.
 func queryCancelled(t *testing.T, r Resolver) {
@@ -40,9 +37,9 @@ func queryCancelled(t *testing.T, r Resolver) {
 	q, err := NewQuestion("example.com.", dnsmessage.TypeA)
 	require.NoError(t, err)
 	const wait = 50 * time.Millisecond
-	ctx, cancel := context.WithCancelCause(context.Background())
+	ctx, cancel := context.WithCancel(context.Background())
 	start := time.Now()
-	time.AfterFunc(wait, func() { cancel(errShutdown) })
+	time.AfterFunc(wait, cancel)
 	errc := make(chan error, 1)
 	go func() {
 		_, err := r.Query(ctx, *q)
@@ -50,11 +47,11 @@ func queryCancelled(t *testing.T, r Resolver) {
 	}()
 	select {
 	case err := <-errc:
-		// Still waiting when cancelled, and failed because it was.
+		// Still waiting when cancelled, and ended by the deadline the
+		// cancellation set.
 		require.GreaterOrEqual(t, time.Since(start), wait)
-		require.ErrorIs(t, err, context.Canceled)
-		require.ErrorIs(t, err, errShutdown)
 		require.ErrorIs(t, err, ErrReceive)
+		require.ErrorIs(t, err, os.ErrDeadlineExceeded)
 	case <-time.After(5 * time.Second):
 		t.Fatal("the query was still waiting for an answer long after its context was cancelled")
 	}
@@ -173,17 +170,4 @@ func TestTLSResolverClosesConnectionOnHandshakeFailure(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("the resolver left the connection of a failed handshake open")
 	}
-}
-
-// A query whose context reached its deadline reports it, even when the conn's
-// deadline fires before the context's own timer.
-func TestWithCancelCauseDeadlinePassed(t *testing.T) {
-	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
-	defer cancel()
-	timeout := &net.OpError{Op: "read", Err: os.ErrDeadlineExceeded}
-	require.ErrorIs(t, withCancelCause(ctx, timeout), context.DeadlineExceeded)
-	// Not a timeout: left alone.
-	require.Equal(t, io.EOF, withCancelCause(ctx, io.EOF))
-	// A live context: left alone.
-	require.Equal(t, error(timeout), withCancelCause(context.Background(), timeout))
 }
