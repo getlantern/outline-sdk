@@ -59,23 +59,31 @@ func bindingAnswer(qtype dnsmessage.Type, data []byte) dnsmessage.Resource {
 	}
 }
 
-// typedAnswer round-trips answer through dnsmessage, whose parser returns
-// HTTPS and SVCB records as typed resources.
-func typedAnswer(t *testing.T, answer dnsmessage.Resource) dnsmessage.Resource {
-	t.Helper()
+// parseTyped round-trips answer through dnsmessage, whose parser returns
+// HTTPS and SVCB records as typed resources, as a real response arrives.
+func parseTyped(answer dnsmessage.Resource) (dnsmessage.Resource, error) {
 	msg := dnsmessage.Message{Header: dnsmessage.Header{Response: true}, Answers: []dnsmessage.Resource{answer}}
 	wire, err := msg.Pack()
 	if err != nil {
-		t.Fatal(err)
+		return dnsmessage.Resource{}, err
 	}
 	var parsed dnsmessage.Message
 	if err := parsed.Unpack(wire); err != nil {
+		return dnsmessage.Resource{}, err
+	}
+	return parsed.Answers[0], nil
+}
+
+func typedAnswer(t *testing.T, answer dnsmessage.Resource) dnsmessage.Resource {
+	t.Helper()
+	typed, err := parseTyped(answer)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if _, raw := parsed.Answers[0].Body.(*dnsmessage.UnknownResource); raw {
+	if _, raw := typed.Body.(*dnsmessage.UnknownResource); raw {
 		t.Fatalf("dnsmessage parsed %v as UnknownResource, want a typed resource", answer.Header.Type)
 	}
-	return parsed.Answers[0]
+	return typed
 }
 
 func TestFormatSVCB(t *testing.T) {
@@ -115,6 +123,11 @@ func TestFormatSVCB(t *testing.T) {
 	}
 }
 
+// acceptedTyped are malformed records formatSVCB accepts once dnsmessage has
+// parsed them. dnsmessage follows a compressed target, which RFC 9460
+// forbids, so the decoded name no longer shows the compression.
+var acceptedTyped = map[string]bool{"compressed target": true}
+
 func TestFormatSVCBMalformed(t *testing.T) {
 	for _, tc := range []struct{ name, wire string }{
 		{"empty", ""},
@@ -147,8 +160,26 @@ func TestFormatSVCBMalformed(t *testing.T) {
 		{"short IPv6 hint", "0001000006000120"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if _, err := formatSVCB(bindingAnswer(typeHTTPS, decodeHex(t, tc.wire))); err == nil {
+			answer := bindingAnswer(typeHTTPS, decodeHex(t, tc.wire))
+			if _, err := formatSVCB(answer); err == nil {
 				t.Fatal("accepted malformed record")
+			}
+			// A real response arrives typed: dnsmessage must reject the
+			// record while parsing, or formatSVCB must.
+			typed, err := parseTyped(answer)
+			if err != nil {
+				return
+			}
+			_, err = formatSVCB(typed)
+			if acceptedTyped[tc.name] {
+				// Documents the known gap rather than covering it.
+				if err != nil {
+					t.Fatalf("typed path now rejects it (%v): drop it from acceptedTyped", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatal("accepted malformed record once dnsmessage parsed it")
 			}
 		})
 	}

@@ -67,8 +67,9 @@ func formatSVCB(answer dnsmessage.Resource) (string, error) {
 }
 
 // repackBinding decodes an answer dnsmessage has already parsed, by packing it
-// into a message of its own for mdns. dnsmessage's parser has decoded the
-// target name, so unpackBinding's compression check doesn't apply.
+// into a message of its own for mdns. dnsmessage has already followed any
+// compression in the target name, which RFC 9460 forbids, so unlike
+// unpackBinding this path accepts a compressed target.
 func repackBinding(answer dnsmessage.Resource) (mdns.RR, error) {
 	msg := dnsmessage.Message{
 		Header:  dnsmessage.Header{Response: true},
