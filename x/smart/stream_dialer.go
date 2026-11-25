@@ -329,11 +329,11 @@ func (c *closeOnceConn) Close() error {
 	return c.err
 }
 
-// withCause adds why ctx ended to err, an I/O error, when closed reports
-// that ctx's ending closed the connection, so a probe that timed out says so
-// and one the server reset doesn't.
+// withCause adds why ctx ended to err, an I/O error, when err is the one a
+// closed connection returns and closed reports that ctx's ending closed it,
+// so a probe that timed out says so and one the server reset doesn't.
 func withCause(ctx context.Context, closed *atomic.Bool, err error) error {
-	if closed.Load() {
+	if closed.Load() && errors.Is(err, net.ErrClosed) {
 		return fmt.Errorf("%w: %w", context.Cause(ctx), err)
 	}
 	return err

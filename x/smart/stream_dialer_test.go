@@ -3,6 +3,8 @@ package smart
 import (
 	"context"
 	"crypto/x509"
+	"errors"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"sync"
@@ -207,4 +209,22 @@ func TestCloseOnceConnClosesOnce(t *testing.T) {
 	}
 	wg.Wait()
 	require.Equal(t, int32(1), inner.closes.Load())
+}
+
+func TestWithCause(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	closedErr := &net.OpError{Op: "read", Err: net.ErrClosed}
+	reset := errors.New("read: connection reset by peer")
+	var notClosed, closed atomic.Bool
+	closed.Store(true)
+
+	// Our close caused the error: it names the cause.
+	err := withCause(ctx, &closed, closedErr)
+	require.ErrorIs(t, err, context.Canceled)
+	require.ErrorIs(t, err, net.ErrClosed)
+	// The context ended, but didn't close the connection.
+	require.Equal(t, closedErr, withCause(ctx, &notClosed, closedErr))
+	// It closed the connection, but the server's reset came first.
+	require.Equal(t, reset, withCause(ctx, &closed, reset))
 }
