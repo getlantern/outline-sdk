@@ -19,6 +19,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"io"
@@ -28,6 +29,7 @@ import (
 	"reflect"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/goccy/go-yaml"
@@ -66,6 +68,8 @@ type finder struct {
 	logWriter       io.Writer
 	cache           StrategyResultCache
 	fallbackParsers map[string]FallbackParser
+	// rootCAs verifies the test domains' certificates. Nil uses the system's.
+	rootCAs *x509.CertPool
 }
 
 type httpsEntryConfig struct {
@@ -262,10 +266,22 @@ func (f *finder) testDialerSingleDomain(ctx context.Context, dialer transport.St
 		logCtx(ctx, "🏁 failed to dial: '%v' (domain: %v), duration=%v, dial_error=%v ❌\n", transportCfg, testDomain, time.Since(startTime), err)
 		return err
 	}
+	// The request's write and the response's read take no context, so a
+	// server that completes TLS and then goes silent would hold them, and the
+	// connection, after the test's time is up. Closing it ends them. The
+	// connection may be closed from here, from tls's handshake interrupt and
+	// by tlsConn.Close, so closeOnceConn makes those one call.
+	testConn = &closeOnceConn{StreamConn: testConn}
+	var closedByCtx atomic.Bool
+	stop := context.AfterFunc(testCtx, func() {
+		closedByCtx.Store(true)
+		testConn.Close()
+	})
+	defer stop()
 
 	// TLS Connection
 
-	tlsConn := tls.Client(testConn, &tls.Config{ServerName: testDomain})
+	tlsConn := tls.Client(testConn, &tls.Config{ServerName: testDomain, RootCAs: f.rootCAs})
 	defer tlsConn.Close()
 	err = tlsConn.HandshakeContext(testCtx)
 	if err != nil {
@@ -281,12 +297,14 @@ func (f *finder) testDialerSingleDomain(ctx context.Context, dialer transport.St
 	}
 
 	if err := req.Write(tlsConn); err != nil {
+		err = withCause(testCtx, &closedByCtx, err)
 		logCtx(ctx, "🏁 failed to write HTTP request: '%v' (domain: %v), duration=%v, error=%v ❌\n", transportCfg, testDomain, time.Since(startTime), err)
 		return err
 	}
 
 	resp, err := http.ReadResponse(bufio.NewReader(tlsConn), req)
 	if err != nil {
+		err = withCause(testCtx, &closedByCtx, err)
 		logCtx(ctx, "🏁 failed to read HTTP response: '%v' (domain: %v), duration=%v, error=%v ❌\n", transportCfg, testDomain, time.Since(startTime), err)
 		return err
 	}
@@ -296,6 +314,29 @@ func (f *finder) testDialerSingleDomain(ctx context.Context, dialer transport.St
 
 	logCtx(ctx, "🏁 success: '%v' (domain: %v), duration=%v, status=ok ✅\n", transportCfg, testDomain, time.Since(startTime))
 	return nil
+}
+
+// closeOnceConn closes its connection once, however many callers close it
+// and from however many goroutines, and returns that close's error to each.
+type closeOnceConn struct {
+	transport.StreamConn
+	once sync.Once
+	err  error
+}
+
+func (c *closeOnceConn) Close() error {
+	c.once.Do(func() { c.err = c.StreamConn.Close() })
+	return c.err
+}
+
+// withCause adds why ctx ended to err, an I/O error, when err is the one a
+// closed connection returns and closed reports that ctx's ending closed it,
+// so a probe that timed out says so and one the server reset doesn't.
+func withCause(ctx context.Context, closed *atomic.Bool, err error) error {
+	if closed.Load() && errors.Is(err, net.ErrClosed) {
+		return fmt.Errorf("%w: %w", context.Cause(ctx), err)
+	}
+	return err
 }
 
 // Test that a dialer is able to access all the given test domains. Returns nil if all tests succeed
