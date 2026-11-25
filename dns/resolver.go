@@ -305,14 +305,27 @@ func unblockOnDone(ctx context.Context, conn interface{ SetDeadline(time.Time) e
 	return context.AfterFunc(ctx, func() { conn.SetDeadline(time.Now()) })
 }
 
-// withCancelCause adds why ctx ended to err when err is the deadline
-// unblockOnDone forced, so a query cancelled without a deadline reports its
-// cancellation rather than an I/O timeout.
+// withCancelCause adds ctx's error, and its cause when that differs, to err
+// when err is a timeout and ctx has ended or reached its deadline, so a query
+// ended by its context says so rather than reporting only an I/O timeout. The
+// conn's deadline and ctx's timer fire together, so a deadline already passed
+// counts as ended even before ctx.Err reports it.
 func withCancelCause(ctx context.Context, err error) error {
-	if err != nil && ctx.Err() != nil && errors.Is(err, os.ErrDeadlineExceeded) {
-		return fmt.Errorf("%w: %w", context.Cause(ctx), err)
+	var netErr net.Error
+	if err == nil || !(errors.Is(err, os.ErrDeadlineExceeded) || errors.As(err, &netErr) && netErr.Timeout()) {
+		return err
 	}
-	return err
+	ctxErr := ctx.Err()
+	if deadline, ok := ctx.Deadline(); ctxErr == nil && ok && !time.Now().Before(deadline) {
+		ctxErr = context.DeadlineExceeded
+	}
+	if ctxErr == nil {
+		return err
+	}
+	if cause := context.Cause(ctx); cause != nil && cause != ctxErr {
+		return fmt.Errorf("%w: %w: %w", err, ctxErr, cause)
+	}
+	return fmt.Errorf("%w: %w", err, ctxErr)
 }
 
 // NewTCPResolver creates a [Resolver] that implements the [DNS-over-TCP] protocol, using a [transport.StreamDialer] for transport.
