@@ -2,10 +2,62 @@ package smart
 
 import (
 	"context"
+	"crypto/x509"
+	"net/http"
+	"net/http/httptest"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
+	"golang.getoutline.org/sdk/transport"
 )
+
+// A server that completes TLS and never answers mustn't hold the probe, or
+// its connection, once the test's time is up.
+func TestProbeClosesStalledConnection(t *testing.T) {
+	closed := make(chan struct{})
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		// Ends when the client closes the connection.
+		<-r.Context().Done()
+		close(closed)
+	}))
+	srv.StartTLS()
+	defer func() {
+		srv.CloseClientConnections()
+		srv.Close()
+	}()
+	roots := x509.NewCertPool()
+	roots.AddCert(srv.Certificate())
+	f := &finder{testTimeout: time.Second, rootCAs: roots}
+	var conn *countingCloseConn
+	dialer := transport.FuncStreamDialer(func(ctx context.Context, _ string) (transport.StreamConn, error) {
+		c, err := (&transport.TCPDialer{}).DialStream(ctx, srv.Listener.Addr().String())
+		if err != nil {
+			return nil, err
+		}
+		conn = &countingCloseConn{StreamConn: c}
+		return conn, nil
+	})
+
+	errc := make(chan error, 1)
+	go func() { errc <- f.testDialerSingleDomain(context.Background(), dialer, "example.com", "") }()
+	select {
+	case err := <-errc:
+		require.ErrorIs(t, err, context.DeadlineExceeded)
+	case <-time.After(5 * time.Second):
+		t.Fatal("the probe was still waiting for a response long after its timeout")
+	}
+	select {
+	case <-closed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the probe's connection was left open")
+	}
+	// Closed when the test timed out, and again by tlsConn.Close, but only
+	// once in the connection itself.
+	require.Equal(t, int32(1), conn.closes.Load())
+}
 
 func TestParseConfig_InvalidConfig(t *testing.T) {
 	config := `
@@ -127,4 +179,32 @@ func TestMakeConfigErrorSignature(t *testing.T) {
 		signature := makeConfigErrorSignature(context.Background(), config)
 		require.Equal(t, `{psiphon: {SponsorId: longlonglonglonglonglonglonglonglonglonglonglonglonglongl…`, signature)
 	})
+}
+
+type countingCloseConn struct {
+	transport.StreamConn
+	closes atomic.Int32
+}
+
+func (c *countingCloseConn) Close() error {
+	c.closes.Add(1)
+	if c.StreamConn == nil {
+		return nil
+	}
+	return c.StreamConn.Close()
+}
+
+func TestCloseOnceConnClosesOnce(t *testing.T) {
+	inner := &countingCloseConn{}
+	c := &closeOnceConn{StreamConn: inner}
+	var wg sync.WaitGroup
+	for range 8 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			c.Close()
+		}()
+	}
+	wg.Wait()
+	require.Equal(t, int32(1), inner.closes.Load())
 }
