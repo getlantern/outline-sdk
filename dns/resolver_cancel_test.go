@@ -30,26 +30,32 @@ import (
 	"golang.org/x/net/dns/dnsmessage"
 )
 
-// queryCancelled queries r with a context that is cancelled, with no deadline,
-// after a short wait, and fails unless the query returns soon after.
-func queryCancelled(t *testing.T, r Resolver) {
+// queryCancelled queries r with a context that is cancelled, with no
+// deadline, once received reports the server got the query, and fails unless
+// the query returns soon after.
+func queryCancelled(t *testing.T, r Resolver, received <-chan struct{}) {
 	t.Helper()
 	q, err := NewQuestion("example.com.", dnsmessage.TypeA)
 	require.NoError(t, err)
-	const wait = 50 * time.Millisecond
 	ctx, cancel := context.WithCancel(context.Background())
-	start := time.Now()
-	time.AfterFunc(wait, cancel)
+	defer cancel()
 	errc := make(chan error, 1)
 	go func() {
 		_, err := r.Query(ctx, *q)
 		errc <- err
 	}()
 	select {
+	case <-received:
+		cancel()
 	case err := <-errc:
-		// Still waiting when cancelled, and ended by the deadline the
-		// cancellation set.
-		require.GreaterOrEqual(t, time.Since(start), wait)
+		t.Fatalf("the query ended before the server got it: %v", err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("the server never got the query")
+	}
+	select {
+	case err := <-errc:
+		// Waiting for the answer when cancelled, and ended by the deadline
+		// the cancellation set.
 		require.ErrorIs(t, err, ErrReceive)
 		require.ErrorIs(t, err, os.ErrDeadlineExceeded)
 	case <-time.After(5 * time.Second):
@@ -63,26 +69,34 @@ func TestStreamResolverCancelledWithoutDeadline(t *testing.T) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	require.NoError(t, err)
 	defer ln.Close()
+	received := make(chan struct{})
 	go func() {
-		for {
-			conn, err := ln.Accept()
-			if err != nil {
-				return
-			}
-			go func() {
-				defer conn.Close()
-				io.Copy(io.Discard, conn)
-			}()
+		conn, err := ln.Accept()
+		if err != nil {
+			return
 		}
+		defer conn.Close()
+		// The query's two-byte length prefix arrives first.
+		if _, err := io.ReadFull(conn, make([]byte, 2)); err != nil {
+			return
+		}
+		close(received)
+		io.Copy(io.Discard, conn)
 	}()
-	queryCancelled(t, NewTCPResolver(&transport.TCPDialer{}, ln.Addr().String()))
+	queryCancelled(t, NewTCPResolver(&transport.TCPDialer{}, ln.Addr().String()), received)
 }
 
 func TestUDPResolverCancelledWithoutDeadline(t *testing.T) {
 	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
 	require.NoError(t, err)
 	defer pc.Close()
-	queryCancelled(t, NewUDPResolver(&transport.UDPDialer{}, pc.LocalAddr().String()))
+	received := make(chan struct{})
+	go func() {
+		if _, _, err := pc.ReadFrom(make([]byte, 512)); err == nil {
+			close(received)
+		}
+	}()
+	queryCancelled(t, NewUDPResolver(&transport.UDPDialer{}, pc.LocalAddr().String()), received)
 }
 
 // A DNS-over-HTTPS resolver closes a connection that has been idle for
