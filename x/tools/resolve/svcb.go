@@ -28,28 +28,82 @@ const (
 	typeHTTPS = dnsmessage.Type(mdns.TypeHTTPS)
 )
 
-// formatSVCB formats the RDATA of either an HTTPS or SVCB answer. The pinned
-// dnsmessage version exposes these records as UnknownResource.
+var errNotBinding = errors.New("expected HTTPS or SVCB resource data")
+
+// formatSVCB formats the RDATA of either an HTTPS or SVCB answer. Older
+// dnsmessage versions expose these records as UnknownResource, and newer ones
+// as SVCBResource or HTTPSResource.
 func formatSVCB(answer dnsmessage.Resource) (string, error) {
-	body, ok := answer.Body.(*dnsmessage.UnknownResource)
-	if !ok || body == nil || (answer.Header.Type != typeHTTPS && answer.Header.Type != typeSVCB) {
-		return "", errors.New("expected HTTPS or SVCB resource data")
+	if answer.Header.Type != typeHTTPS && answer.Header.Type != typeSVCB {
+		return "", errNotBinding
 	}
-	data := body.Data
+	var (
+		rr  mdns.RR
+		err error
+	)
+	switch body := answer.Body.(type) {
+	case *dnsmessage.UnknownResource:
+		if body == nil {
+			return "", errNotBinding
+		}
+		rr, err = unpackBinding(answer, body.Data)
+	case *dnsmessage.SVCBResource:
+		if body == nil {
+			return "", errNotBinding
+		}
+		rr, err = repackBinding(answer)
+	case *dnsmessage.HTTPSResource:
+		if body == nil {
+			return "", errNotBinding
+		}
+		rr, err = repackBinding(answer)
+	default:
+		return "", errNotBinding
+	}
+	if err != nil {
+		return "", err
+	}
+	return presentBinding(rr)
+}
+
+// repackBinding decodes an answer dnsmessage has already parsed, by packing it
+// into a message of its own for mdns. dnsmessage's parser has decoded the
+// target name, so unpackBinding's compression check doesn't apply.
+func repackBinding(answer dnsmessage.Resource) (mdns.RR, error) {
+	msg := dnsmessage.Message{
+		Header:  dnsmessage.Header{Response: true},
+		Answers: []dnsmessage.Resource{answer},
+	}
+	wire, err := msg.Pack()
+	if err != nil {
+		return nil, fmt.Errorf("invalid HTTPS/SVCB data: %w", err)
+	}
+	var m mdns.Msg
+	if err := m.Unpack(wire); err != nil {
+		return nil, fmt.Errorf("invalid HTTPS/SVCB data: %w", err)
+	}
+	if len(m.Answer) != 1 {
+		return nil, errNotBinding
+	}
+	return m.Answer[0], nil
+}
+
+// unpackBinding decodes data, an HTTPS or SVCB answer's RDATA.
+func unpackBinding(answer dnsmessage.Resource, data []byte) (mdns.RR, error) {
 	if len(data) < 3 || len(data) > 65535 {
-		return "", errors.New("invalid HTTPS/SVCB data length")
+		return nil, errors.New("invalid HTTPS/SVCB data length")
 	}
 	// RFC 9460 section 2.2 forbids compression in TargetName. Check this before
 	// decoding standalone RDATA, where pointers into the original message would
 	// otherwise be interpreted relative to the wrong buffer.
 	for off := 2; ; {
 		if off >= len(data) {
-			return "", errors.New("unterminated HTTPS/SVCB target")
+			return nil, errors.New("unterminated HTTPS/SVCB target")
 		}
 		size := int(data[off])
 		off++
 		if size > 63 || off+size > len(data) || off+size-2 > 255 {
-			return "", errors.New("invalid or compressed HTTPS/SVCB target")
+			return nil, errors.New("invalid or compressed HTTPS/SVCB target")
 		}
 		if size == 0 {
 			break
@@ -65,14 +119,22 @@ func formatSVCB(answer dnsmessage.Resource) (string, error) {
 	}
 	rr, _, err := mdns.UnpackRRWithHeader(header, data, 0)
 	if err != nil {
-		return "", fmt.Errorf("invalid HTTPS/SVCB data: %w", err)
+		return nil, fmt.Errorf("invalid HTTPS/SVCB data: %w", err)
 	}
+	return rr, nil
+}
+
+// presentBinding checks rr, an HTTPS or SVCB record, for the format
+// constraints mdns leaves to its caller, and formats its RDATA.
+func presentBinding(rr mdns.RR) (string, error) {
 	var record *mdns.SVCB
 	switch rr := rr.(type) {
 	case *mdns.SVCB:
 		record = rr
 	case *mdns.HTTPS:
 		record = &rr.SVCB
+	default:
+		return "", errNotBinding
 	}
 	// The codec checks parameter framing, ordering and most value lengths, but
 	// leaves these format constraints to its caller.
