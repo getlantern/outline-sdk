@@ -271,6 +271,7 @@ func NewUDPResolver(pd transport.PacketDialer, resolverAddr string) Resolver {
 		if deadline, ok := ctx.Deadline(); ok {
 			conn.SetDeadline(deadline)
 		}
+		defer unblockOnDone(ctx, conn)()
 		return queryDatagram(conn, q)
 	})
 }
@@ -289,7 +290,16 @@ func (r *streamResolver) Query(ctx context.Context, q dnsmessage.Question) (*dns
 	if deadline, ok := ctx.Deadline(); ok {
 		conn.SetDeadline(deadline)
 	}
+	defer unblockOnDone(ctx, conn)()
 	return queryStream(conn, q)
+}
+
+// unblockOnDone moves conn's deadline to now once ctx ends, so a query's
+// reads and writes, which take no context, end with it. A deadline on ctx
+// already bounds them, but a cancellation alone didn't. The returned func
+// must be called once the query returns.
+func unblockOnDone(ctx context.Context, conn interface{ SetDeadline(time.Time) error }) func() bool {
+	return context.AfterFunc(ctx, func() { conn.SetDeadline(time.Now()) })
 }
 
 // NewTCPResolver creates a [Resolver] that implements the [DNS-over-TCP] protocol, using a [transport.StreamDialer] for transport.
@@ -324,6 +334,10 @@ func NewTLSResolver(sd transport.StreamDialer, resolverAddr string, resolverName
 	}
 }
 
+// httpsIdleConnTimeout is how long a DNS-over-HTTPS resolver keeps an idle
+// connection, the same as [http.DefaultTransport].
+var httpsIdleConnTimeout = 90 * time.Second
+
 // NewHTTPSResolver creates a [Resolver] that implements the [DNS-over-HTTPS] protocol, using a [transport.StreamDialer]
 // to connect to the resolverAddr, and the url as the DoH template URI.
 // It uses an internal HTTP client that reuses connections when possible.
@@ -342,7 +356,6 @@ func NewHTTPSResolver(sd transport.StreamDialer, resolverAddr string, url string
 		}
 		return conn, nil
 	}
-	// TODO: add mechanism to close idle connections.
 	// Copied from Intra: https://github.com/Jigsaw-Code/Intra/blob/d3554846a1146ae695e28a8ed6dd07f0cd310c5a/Android/tun2socks/intra/doh/doh.go#L213-L219
 	httpClient := http.Client{
 		Transport: &http.Transport{
@@ -350,6 +363,9 @@ func NewHTTPSResolver(sd transport.StreamDialer, resolverAddr string, url string
 			ForceAttemptHTTP2:     true,
 			TLSHandshakeTimeout:   10 * time.Second,
 			ResponseHeaderTimeout: 20 * time.Second, // Same value as Android DNS-over-TLS
+			// Without it, idle connections stay open until the server closes
+			// them, however many resolvers a caller makes.
+			IdleConnTimeout: httpsIdleConnTimeout,
 		},
 	}
 	return FuncResolver(func(ctx context.Context, q dnsmessage.Question) (*dnsmessage.Message, error) {
